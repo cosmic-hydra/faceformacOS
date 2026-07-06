@@ -1,0 +1,53 @@
+name: FaceGate
+options:
+  bundleIdPrefix: com.dweep
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    version: 2.9.3
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ENABLE_HARDENED_RUNTIME: NO
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Automatic
+    PRODUCT_BUNDLE_IDENTIFIER: com.dweep.FaceGate
+    MARKETING_VERSION: "1.2.0"
+    CURRENT_PROJECT_VERSION: "5"
+    INFOPLIST_FILE: FaceGate/Resources/Info.plist
+    CODE_SIGN_ENTITLEMENTS: FaceGate.entitlements
+    PRODUCT_NAME: FaceGate
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  FaceGate:
+    type: application
+    platform: macOS
+    sources:
+      - path: FaceGate
+        excludes:
+          - "**/README.md"
+    dependencies:
+      - package: Sparkle
+    resources:
+      - path: FaceGate/Resources/Assets.xcassets
+    settings:
+      base:
+        INFOPLIST_FILE: FaceGate/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: FaceGate.entitlements
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+        COMBINE_HIDPI_IMAGES: YES
+    entitlements:
+      path: FaceGate.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.device.camera: true
+        com.apple.security.cs.disable-library-validation: true
