@@ -2,7 +2,7 @@
 
 **Face ID–style authentication for macOS** — unlock `sudo` / the lock screen with your face, and use a face-gated credential vault as a password-autofill / passkey alternative. On-device, offline, no telemetry.
 
-> ⚠️ **Status: work in progress.** This initial commit contains the project design and scaffolding. The Swift/C source is being generated and integrated next.
+> ⚠️ **Status: source complete, hardware validation in progress.** The SwiftPM package (`FaceUnlockCore` + three CLIs), the PAM module, and the install scripts are implemented. Read the security model below before wiring it into `/etc/pam.d`.
 
 ---
 
@@ -51,12 +51,51 @@ macOS has Touch ID but no built-in facial unlock. This project adds one, reusing
 - A built-in or external camera.
 - A **Core ML face-embedding model** for real recognition (see Limitations).
 
-## Build (once source lands)
+## Build & install
 
 ```bash
-swift build -c release        # builds FaceUnlockCore + the three CLIs
-make -C pam                    # builds the PAM module with clang
-sudo ./scripts/install.sh      # installs binaries + wires /etc/pam.d (with backups)
+swift build -c release              # FaceUnlockCore + the three CLIs (CLT only, no Xcode)
+make -C pam                         # PAM module (clang, universal binary)
+sudo ./scripts/install.sh           # installs binaries + model; prints the pam.d line
+sudo ./scripts/install.sh --enable-sudo          # …and wires /etc/pam.d/sudo_local
+sudo ./scripts/install.sh --enable-screensaver   # …and the lock screen (experimental)
+```
+
+Then, as your normal user:
+
+```bash
+faceunlock-enroll --user "$USER" --frames 9      # look straight, then slightly to each side
+faceunlock-verify --user "$USER" --timeout 10    # exit 0 = match; add --require-liveness
+sudo -k; sudo true                               # face-unlocked sudo (test in a NEW terminal)
+```
+
+Face-gated credential vault:
+
+```bash
+faceunlock-autofill set  --label github          # secret read from stdin, never argv
+faceunlock-autofill get  --label github | pbcopy # face scan (with liveness), then release
+faceunlock-autofill type --label github          # face scan, then types it for you
+```
+
+### CLI ↔ PAM contract
+
+`faceunlock-verify --user NAME --timeout SEC [--require-liveness]` exits
+`0` = match, `1` = no match, `2` = error, and its last stdout line is always
+`RESULT match|nomatch|error score=NN`. `pam_faceunlock.so` execs exactly
+`/usr/local/bin/faceunlock-verify --user <user> --timeout 10` (root-ownership
+checked, privileges dropped to the user, minimal env, hard kill past the
+deadline) and maps exit 0 → `PAM_SUCCESS`, anything else → `PAM_AUTH_ERR`.
+Module options: `timeout=N`, `require_liveness`, `debug`, `quiet`.
+
+### Repo layout
+
+```
+Sources/FaceUnlockCore/    # library: camera, detector, liveness, embedder, matcher, stores
+Sources/faceunlock-*/      # the three CLIs
+pam/                       # pam_faceunlock.c + Makefile
+scripts/                   # install.sh / uninstall.sh (pam.d wiring with backups)
+extension/                 # AutoFill credential-provider reference (needs Xcode to build)
+FaceGate/                  # upstream FaceGate-Mac app (pipeline source + bundled ML model)
 ```
 
 ## Honest limitations & security model
