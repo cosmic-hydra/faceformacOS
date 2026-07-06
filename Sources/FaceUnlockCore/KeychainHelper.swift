@@ -1,19 +1,20 @@
 import Foundation
 import Security
 
-/// Wrapper around the macOS Keychain for secure key storage.
-/// Ported from FaceGate, generalized from a singleton to an instance so the
-/// service name is injectable.
+/// Thin wrapper around the macOS Keychain (`SecItem*`).
+/// Ported from FaceGate-Mac with a configurable service name.
 public final class KeychainHelper {
-    public let service: String
+    public static let shared = KeychainHelper(service: FaceUnlockConfig.keychainService)
 
-    public init(service: String = FUConstants.keychainService) {
+    private let service: String
+
+    public init(service: String) {
         self.service = service
     }
 
     // MARK: - Public API
 
-    /// Save data to the Keychain. Overwrites an existing entry if present.
+    /// Save data, overwriting any existing entry.
     public func save(_ data: Data, for account: String) throws {
         let query = baseQuery(for: account)
         let updateAttributes: [String: Any] = [kSecValueData as String: data]
@@ -25,15 +26,14 @@ public final class KeychainHelper {
             addQuery[kSecValueData as String] = data
             let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
             guard addStatus == errSecSuccess else {
-                throw KeychainError.unableToSave(status: addStatus)
+                throw FaceUnlockError.keychainError(addStatus)
             }
         } else if updateStatus != errSecSuccess {
-            throw KeychainError.unableToSave(status: updateStatus)
+            throw FaceUnlockError.keychainError(updateStatus)
         }
     }
 
-    /// Read data from the Keychain. Returns nil if not found or inaccessible
-    /// (e.g. locked keychain in a PAM context).
+    /// Read data, or nil if the entry does not exist.
     public func read(for account: String) -> Data? {
         var query = baseQuery(for: account)
         query[kSecReturnData as String] = true
@@ -46,29 +46,15 @@ public final class KeychainHelper {
         return result as? Data
     }
 
-    /// Delete an entry from the Keychain.
+    /// Delete an entry (no error if missing).
     public func delete(for account: String) {
         let query = baseQuery(for: account)
         SecItemDelete(query as CFDictionary)
     }
 
-    /// Check whether an entry exists.
+    /// Whether an entry exists.
     public func exists(for account: String) -> Bool {
         read(for: account) != nil
-    }
-
-    // MARK: - Convenience (String)
-
-    public func saveString(_ string: String, for account: String) throws {
-        guard let data = string.data(using: .utf8) else {
-            throw KeychainError.encodingError
-        }
-        try save(data, for: account)
-    }
-
-    public func readString(for account: String) -> String? {
-        guard let data = read(for: account) else { return nil }
-        return String(data: data, encoding: .utf8)
     }
 
     // MARK: - Private
@@ -79,21 +65,5 @@ public final class KeychainHelper {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-    }
-}
-
-// MARK: - Errors
-
-public enum KeychainError: LocalizedError {
-    case unableToSave(status: OSStatus)
-    case encodingError
-
-    public var errorDescription: String? {
-        switch self {
-        case .unableToSave(let status):
-            return "Keychain save failed with status: \(status)"
-        case .encodingError:
-            return "Failed to encode data for Keychain storage"
-        }
     }
 }

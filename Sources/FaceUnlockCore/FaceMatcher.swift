@@ -1,7 +1,7 @@
 import Foundation
 
 /// Compares live face embeddings against enrolled reference embeddings
-/// using cosine similarity. (Ported from FaceGate; made public.)
+/// using cosine similarity. Ported from FaceGate-Mac.
 public final class FaceMatcher {
     public struct MatchResult {
         public let isMatch: Bool
@@ -11,16 +11,16 @@ public final class FaceMatcher {
 
     private var threshold: Float
 
-    public init(threshold: Float = FUConstants.defaultFaceUnlockThreshold) {
+    public init(threshold: Float = FaceUnlockConfig.defaultMatchThreshold) {
         self.threshold = max(0.0, min(1.0, threshold))
     }
 
     /// Update the matching threshold.
     public func setThreshold(_ newThreshold: Float) {
-        self.threshold = max(0.0, min(1.0, newThreshold))
+        threshold = max(0.0, min(1.0, newThreshold))
     }
 
-    /// Check whether a live embedding matches any enrolled embedding.
+    /// Match a live embedding against every enrolled embedding; best score wins.
     public func match(liveEmbedding: [Float], against enrolledEmbeddings: [[Float]]) -> MatchResult {
         guard !enrolledEmbeddings.isEmpty else {
             return MatchResult(isMatch: false, bestSimilarity: -1.0, threshold: threshold)
@@ -34,18 +34,12 @@ public final class FaceMatcher {
             }
         }
 
-        return MatchResult(
-            isMatch: bestSimilarity >= threshold,
-            bestSimilarity: bestSimilarity,
-            threshold: threshold
-        )
+        return MatchResult(isMatch: bestSimilarity >= threshold, bestSimilarity: bestSimilarity, threshold: threshold)
     }
 
-    /// Check match against the normalized centroid of all enrolled embeddings —
-    /// more robust than any single reference frame.
+    /// Match against the normalized centroid of the enrolled embeddings.
     public func matchAgainstCentroid(liveEmbedding: [Float], enrolledEmbeddings: [[Float]]) -> MatchResult {
-        guard !enrolledEmbeddings.isEmpty,
-              let first = enrolledEmbeddings.first else {
+        guard let first = enrolledEmbeddings.first else {
             return MatchResult(isMatch: false, bestSimilarity: -1.0, threshold: threshold)
         }
 
@@ -66,10 +60,6 @@ public final class FaceMatcher {
         centroid = VectorMath.normalize(centroid)
         let similarity = VectorMath.cosineSimilarity(liveEmbedding, centroid)
 
-        return MatchResult(
-            isMatch: similarity >= threshold,
-            bestSimilarity: similarity,
-            threshold: threshold
-        )
+        return MatchResult(isMatch: similarity >= threshold, bestSimilarity: similarity, threshold: threshold)
     }
 }

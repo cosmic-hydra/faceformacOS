@@ -1,11 +1,8 @@
-// swift-tools-version:5.9
-// faceformacOS — headless Face ID-style authentication for macOS.
-// Builds with Command Line Tools only (no Xcode required):
-//   swift build -c release
+// swift-tools-version: 5.9
 import PackageDescription
 
 let package = Package(
-    name: "FaceUnlock",
+    name: "faceformacOS",
     platforms: [
         .macOS(.v14)
     ],
@@ -16,11 +13,29 @@ let package = Package(
         .executable(name: "faceunlock-autofill", targets: ["faceunlock-autofill"]),
     ],
     targets: [
-        // Apple frameworks (Vision, AVFoundation, CoreML, CryptoKit, Security,
-        // Accelerate) are auto-linked when imported — no linker settings needed.
-        .target(name: "FaceUnlockCore"),
-        .executableTarget(name: "faceunlock-enroll", dependencies: ["FaceUnlockCore"]),
-        .executableTarget(name: "faceunlock-verify", dependencies: ["FaceUnlockCore"]),
-        .executableTarget(name: "faceunlock-autofill", dependencies: ["FaceUnlockCore"]),
+        .target(
+            name: "FaceUnlockCore",
+            path: "Sources/FaceUnlockCore"
+        ),
+        .executableTarget(
+            name: "faceunlock-enroll",
+            dependencies: ["FaceUnlockCore"],
+            path: "Sources/faceunlock-enroll"
+        ),
+        .executableTarget(
+            name: "faceunlock-verify",
+            dependencies: ["FaceUnlockCore"],
+            path: "Sources/faceunlock-verify"
+        ),
+        .executableTarget(
+            name: "faceunlock-autofill",
+            dependencies: ["FaceUnlockCore"],
+            path: "Sources/faceunlock-autofill"
+        ),
+        .testTarget(
+            name: "FaceUnlockCoreTests",
+            dependencies: ["FaceUnlockCore"],
+            path: "Tests/FaceUnlockCoreTests"
+        ),
     ]
 )

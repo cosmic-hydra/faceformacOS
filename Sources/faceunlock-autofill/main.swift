@@ -1,205 +1,161 @@
-// faceunlock-autofill — face-gated credential vault.
-//
-//   faceunlock-autofill set  --user NAME [--label L]   (secret read from stdin)
-//   faceunlock-autofill get  --user NAME [--label L]   (face verify, then print)
-//   faceunlock-autofill type --user NAME [--label L]   (face verify, then keystrokes)
-//   faceunlock-autofill list | remove --label L
-//
-// Secrets are never passed on argv (visible in `ps`); `set` reads stdin.
-// `get`/`type` run the full face verification (with liveness by default)
-// before releasing anything.
-import CoreGraphics
 import FaceUnlockCore
 import Foundation
 
+// faceunlock-autofill — face-gated credential vault.
+// Secrets are AES-256-GCM encrypted at rest; `get`/`type` require a live face match first.
+
 let usage = """
-Usage: faceunlock-autofill <set|get|type|list|remove> [options]
-  set     store a secret (read from stdin — piped, or prompted without echo)
-  get     verify face, then print the secret to stdout
-  type    verify face, then type the secret as keystrokes (needs Accessibility)
-  list    list stored labels
-  remove  delete a stored secret
+usage: faceunlock-autofill <command> [options]
 
-Options:
-  --user NAME       account (default: current user)
-  --label L         credential label (default: "default")
-  --timeout SEC     verification timeout (default: 10)
-  --threshold F     similarity threshold (default: 0.65)
-  --no-liveness     skip the liveness requirement for get/type
-  --challenge       require the head-turn challenge as well
-  --model PATH      compiled .mlmodelc override
-  --camera ID       capture device unique ID
-  --quiet           suppress progress output on stderr
+commands:
+  add <name>             store a secret (prompted, hidden input; or piped via stdin)
+  get <name>             verify face, then print the secret to stdout
+  type <name>            verify face, then type the secret into the focused field
+  list                   list stored secret names
+  remove <name>          delete a secret
+  help                   show this help
 
-Exit codes: 0 = success, 1 = face verification failed, 2 = error.
+options:
+  --timeout <seconds>    face-verification timeout (default 10)
+  --liveness <mode>      none | blink | turn | auto (default auto)
+  --threshold <0..1>     match threshold (default 0.65)
+  --data-dir <path>      data directory (default ~/Library/Application Support/faceunlock)
+  --model <path>         path to FaceEmbedding.mlmodelc
+  --camera <unique-id>   use a specific camera
+  --delay <seconds>      (type) wait before typing so you can focus the field (default 3)
+  --press-return         (type) press Return after typing
+  --quiet                suppress status output
+
+Secrets are released only after a live face match. `type` requires
+Accessibility permission and does not work in secure input fields
+(e.g. the macOS lock screen).
 """
 
-func fail(_ message: String) -> Never {
-    printErr("faceunlock-autofill: \(message)")
-    exit(2)
+let args = CLIArguments(Array(CommandLine.arguments.dropFirst()),
+                        knownFlags: ["press-return", "quiet", "help"])
+
+guard let command = args.positional.first, command != "help", !args.flag("help") else {
+    print(usage)
+    exit(FaceUnlockExitCode.success.rawValue)
 }
 
-let parsed: ParsedArgs = {
-    do {
-        return try parseCommandLine(
-            Array(CommandLine.arguments.dropFirst()),
-            flagNames: ["--no-liveness", "--challenge", "--quiet", "--help"],
-            optionNames: ["--user", "--label", "--timeout", "--threshold", "--model", "--camera"]
-        )
-    } catch {
-        printErr("faceunlock-autofill: \(error)")
-        printErr(usage)
-        exit(2)
-    }
-}()
+let quiet = args.flag("quiet")
+let dataDir = FaceUnlockConfig.dataDirectory(override: args.string("data-dir"))
+let vault = CredentialVault(dataDir: dataDir)
 
-if parsed.flags.contains("--help") || parsed.positionals.isEmpty {
-    printErr(usage)
-    exit(parsed.flags.contains("--help") ? 0 : 2)
-}
-
-let command = parsed.positionals[0]
-guard parsed.positionals.count == 1 else {
-    fail("unexpected argument \(parsed.positionals[1])")
-}
-
-let user = parsed.options["--user"] ?? NSUserName()
-let label = parsed.options["--label"] ?? CredentialVault.defaultLabel
-let vault = CredentialVault(user: user)
-let quiet = parsed.flags.contains("--quiet")
-
-/// Run face verification with the vault's stricter defaults (liveness on
-/// unless explicitly disabled). Exits the process on failure.
+/// Run face verification; exits the process on failure.
 func requireFaceMatch() {
-    var options = VerifyOptions()
-    options.user = user
-    options.requireLiveness = !parsed.flags.contains("--no-liveness")
-    options.challenge = parsed.flags.contains("--challenge")
-    options.cameraID = parsed.options["--camera"]
-    if let timeoutString = parsed.options["--timeout"] {
-        guard let timeout = TimeInterval(timeoutString), timeout > 0, timeout <= 300 else {
-            fail("invalid --timeout \(timeoutString)")
+    var livenessMode = LivenessMode.auto
+    if let raw = args.string("liveness") {
+        guard let mode = LivenessMode(rawValue: raw) else {
+            printErr("error: invalid --liveness '\(raw)' (expected none|blink|turn|auto)")
+            exit(FaceUnlockExitCode.usageError.rawValue)
         }
-        options.timeout = timeout
+        livenessMode = mode
     }
-    if let thresholdString = parsed.options["--threshold"] {
-        guard let threshold = Float(thresholdString), threshold > 0, threshold < 1 else {
-            fail("invalid --threshold \(thresholdString)")
-        }
-        options.threshold = threshold
-    }
-    if let modelPathString = parsed.options["--model"] {
-        options.modelPath = URL(fileURLWithPath: modelPathString)
-    }
+
+    let options = FaceVerifier.Options(
+        timeout: args.double("timeout") ?? FaceUnlockConfig.defaultVerifyTimeout,
+        threshold: args.float("threshold") ?? FaceUnlockConfig.defaultMatchThreshold,
+        livenessMode: livenessMode,
+        modelPath: args.string("model"),
+        cameraID: args.string("camera"),
+        dataDir: dataDir
+    )
+
+    let verifier = FaceVerifier(options: options)
     if !quiet {
-        options.onStatus = { printErr($0) }
+        var lastStatus = ""
+        verifier.onStatus = { status in
+            guard status != lastStatus else { return }
+            lastStatus = status
+            printErr(status)
+        }
     }
 
-    switch FaceVerifier(options: options).run() {
-    case .match(let score):
-        if !quiet { printErr(String(format: "Face verified (similarity %.2f)", score)) }
-    case .noMatch(_, let reason):
-        printErr("faceunlock-autofill: face verification failed — \(reason)")
-        exit(1)
-    case .error(let message):
-        fail("face verification error — \(message)")
+    do {
+        let outcome = try verifier.verify()
+        guard outcome.matched && outcome.livenessPassed else {
+            printErr("✗ Face verification failed — secret not released.")
+            exit(FaceUnlockExitCode.noMatch.rawValue)
+        }
+        if !quiet { printErr("✓ Face verified") }
+    } catch {
+        printErr("error: \(error.localizedDescription)")
+        exit(FaceUnlockExitCode.from(error).rawValue)
     }
 }
 
-/// Synthesize keystrokes for `text` (Unicode-safe, chunked). Requires the
-/// terminal app to have Accessibility / Input Monitoring permission.
-func typeAsKeystrokes(_ text: String) {
-    guard CGPreflightPostEventAccess() else {
-        _ = CGRequestPostEventAccess()
-        fail("""
-        not allowed to synthesize keystrokes yet. Grant your terminal app
-        Accessibility permission (System Settings → Privacy & Security →
-        Accessibility), then retry.
-        """)
+func requireName() -> String {
+    guard args.positional.count >= 2 else {
+        printErr("error: missing secret name\n")
+        printErr(usage)
+        exit(FaceUnlockExitCode.usageError.rawValue)
     }
+    return args.positional[1]
+}
 
-    let source = CGEventSource(stateID: .combinedSessionState)
-    let utf16 = Array(text.utf16)
-    var index = 0
-    while index < utf16.count {
-        let chunk = Array(utf16[index..<min(index + 16, utf16.count)])
-        for keyDown in [true, false] {
-            guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: keyDown) else { continue }
-            chunk.withUnsafeBufferPointer { buffer in
-                event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: buffer.baseAddress)
+do {
+    switch command {
+    case "add":
+        let name = requireName()
+        let secret: String
+        if isatty(STDIN_FILENO) != 0 {
+            guard let entered = readSecretLine(prompt: "Secret for '\(name)' (input hidden):"), !entered.isEmpty else {
+                printErr("error: empty secret")
+                exit(FaceUnlockExitCode.usageError.rawValue)
             }
-            event.post(tap: .cghidEventTap)
+            secret = entered
+        } else {
+            // Piped input: read all of stdin, trimming the trailing newline.
+            let data = FileHandle.standardInput.readDataToEndOfFile()
+            guard var piped = String(data: data, encoding: .utf8), !piped.isEmpty else {
+                printErr("error: empty secret on stdin")
+                exit(FaceUnlockExitCode.usageError.rawValue)
+            }
+            if piped.hasSuffix("\n") { piped.removeLast() }
+            secret = piped
         }
-        usleep(8000)
-        index += 16
+        try vault.set(name: name, secret: secret)
+        printErr("✓ Stored secret '\(name)'.")
+
+    case "get":
+        let name = requireName()
+        _ = try vault.get(name: name)  // fail fast before opening the camera
+        requireFaceMatch()
+        print(try vault.get(name: name))
+
+    case "type":
+        let name = requireName()
+        _ = try vault.get(name: name)  // fail fast before opening the camera
+        requireFaceMatch()
+        let delay = args.double("delay") ?? 3
+        if !quiet && delay > 0 {
+            printErr("Typing in \(Int(delay))s — focus the target field…")
+        }
+        try AutoType.type(try vault.get(name: name), pressReturn: args.flag("press-return"), delay: delay)
+        if !quiet { printErr("✓ Typed secret '\(name)'.") }
+
+    case "list":
+        let names = try vault.list()
+        if names.isEmpty {
+            printErr("Vault is empty. Add a secret with: faceunlock-autofill add <name>")
+        } else {
+            names.forEach { print($0) }
+        }
+
+    case "remove":
+        let name = requireName()
+        try vault.remove(name: name)
+        printErr("✓ Removed secret '\(name)'.")
+
+    default:
+        printErr("error: unknown command '\(command)'\n")
+        printErr(usage)
+        exit(FaceUnlockExitCode.usageError.rawValue)
     }
+    exit(FaceUnlockExitCode.success.rawValue)
+} catch {
+    printErr("error: \(error.localizedDescription)")
+    exit(FaceUnlockExitCode.from(error).rawValue)
 }
-
-switch command {
-case "set":
-    guard let secret = readSecretLine(prompt: "Secret for \"\(label)\" (input hidden): "),
-          !secret.isEmpty else {
-        fail("no secret provided on stdin")
-    }
-    if isatty(fileno(stdin)) == 1 {
-        guard let confirmation = readSecretLine(prompt: "Repeat to confirm: "),
-              confirmation == secret else {
-            fail("secrets did not match")
-        }
-    }
-    do {
-        try vault.set(label: label, secret: secret)
-    } catch {
-        fail(error.localizedDescription)
-    }
-    printErr("Stored secret \"\(label)\" for \(user).")
-
-case "get":
-    requireFaceMatch()
-    do {
-        let secret = try vault.secret(for: label)
-        // No trailing newline: `faceunlock-autofill get | pbcopy` stays exact.
-        FileHandle.standardOutput.write(secret.data(using: .utf8) ?? Data())
-        if isatty(fileno(stdout)) == 1 { printErr("") }
-    } catch {
-        fail(error.localizedDescription)
-    }
-
-case "type":
-    // Read the secret only after the face gate passes.
-    requireFaceMatch()
-    let secret: String
-    do {
-        secret = try vault.secret(for: label)
-    } catch {
-        fail(error.localizedDescription)
-    }
-    printErr("Typing in 3 seconds — focus the target password field…")
-    Thread.sleep(forTimeInterval: 3)
-    typeAsKeystrokes(secret)
-    printErr("Done.")
-
-case "list":
-    do {
-        for storedLabel in try vault.labels() {
-            print(storedLabel)
-        }
-    } catch {
-        fail(error.localizedDescription)
-    }
-
-case "remove":
-    do {
-        try vault.remove(label: label)
-        printErr("Removed \"\(label)\".")
-    } catch {
-        fail(error.localizedDescription)
-    }
-
-default:
-    printErr("faceunlock-autofill: unknown command \"\(command)\"")
-    printErr(usage)
-    exit(2)
-}
-
-exit(0)

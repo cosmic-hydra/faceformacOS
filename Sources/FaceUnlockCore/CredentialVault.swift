@@ -1,102 +1,88 @@
 import Foundation
 
-/// Face-gated credential vault: labelled secrets, AES-256-GCM encrypted at
-/// rest, with the vault key held **only** in the login Keychain (no key-file
-/// mirror — unlike the enrollment template, the vault is only ever opened in
-/// an interactive user session where the Keychain is available, and a key
-/// file would let anything running as the user bypass the face gate).
+/// Face-gated credential vault: named secrets, AES-256-GCM encrypted at rest,
+/// with the vault key held in the user's Keychain.
 ///
-/// The face gate itself is enforced by the callers (`faceunlock-autofill
-/// get/type` run `FaceVerifier` before calling `secret(for:)`), not by this
-/// class — see the README's security model for what that does and doesn't
-/// protect against.
+/// The vault itself does no face matching — callers (the `faceunlock-autofill`
+/// CLI) must run `FaceVerifier` before releasing a secret.
 public final class CredentialVault {
-    public enum VaultError: LocalizedError {
-        case entryNotFound(String)
-        case emptyVault
-        case corruptVault
-
-        public var errorDescription: String? {
-            switch self {
-            case .entryNotFound(let label):
-                return "No credential stored under label \"\(label)\""
-            case .emptyVault:
-                return "The credential vault is empty — add one with: faceunlock-autofill set"
-            case .corruptVault:
-                return "Credential vault file could not be decoded"
-            }
-        }
+    public struct Entry: Codable {
+        public let name: String
+        public var secret: String
+        public let createdDate: Date
+        public var modifiedDate: Date
     }
 
-    private struct VaultEntry: Codable {
-        var secret: String
-        var updatedDate: Date
+    private struct VaultFile: Codable {
+        var entries: [Entry]
     }
 
-    private struct VaultData: Codable {
-        var entries: [String: VaultEntry] = [:]
-    }
-
-    public static let defaultLabel = "default"
-
-    public let user: String?
     private let crypto: CryptoHelper
-    private let filePath: URL
+    private let fileURL: URL
 
-    public init(user: String?) {
-        self.user = user
-        self.filePath = FUConstants.vaultFilePath(forUser: user)
-        self.crypto = CryptoHelper(
-            keychainAccount: FUConstants.keychainVaultKeyAccount,
-            fallbackKeyFile: nil
-        )
+    public init(dataDir: URL = FaceUnlockConfig.dataDirectory(),
+                crypto: CryptoHelper = CryptoHelper(keyAccount: FaceUnlockConfig.keychainVaultKeyAccount)) {
+        self.crypto = crypto
+        self.fileURL = FaceUnlockConfig.vaultFile(dataDir: dataDir)
     }
 
     // MARK: - Operations
 
-    public func set(label: String, secret: String) throws {
-        var data = try loadOrEmpty()
-        data.entries[label] = VaultEntry(secret: secret, updatedDate: Date())
-        try save(data)
+    /// Store (or overwrite) a named secret.
+    public func set(name: String, secret: String) throws {
+        var vault = try loadOrEmpty()
+        let now = Date()
+        if let index = vault.entries.firstIndex(where: { $0.name == name }) {
+            vault.entries[index].secret = secret
+            vault.entries[index].modifiedDate = now
+        } else {
+            vault.entries.append(Entry(name: name, secret: secret, createdDate: now, modifiedDate: now))
+        }
+        try persist(vault)
     }
 
-    public func secret(for label: String) throws -> String {
-        let data = try loadOrEmpty()
-        guard !data.entries.isEmpty else { throw VaultError.emptyVault }
-        guard let entry = data.entries[label] else {
-            throw VaultError.entryNotFound(label)
+    /// Retrieve a secret by name.
+    public func get(name: String) throws -> String {
+        let vault = try loadOrEmpty()
+        guard let entry = vault.entries.first(where: { $0.name == name }) else {
+            throw FaceUnlockError.secretNotFound(name)
         }
         return entry.secret
     }
 
-    public func labels() throws -> [String] {
-        (try loadOrEmpty()).entries.keys.sorted()
+    /// Names of all stored secrets (never the secrets themselves).
+    public func list() throws -> [String] {
+        try loadOrEmpty().entries.map(\.name).sorted()
     }
 
-    public func remove(label: String) throws {
-        var data = try loadOrEmpty()
-        guard data.entries.removeValue(forKey: label) != nil else {
-            throw VaultError.entryNotFound(label)
+    /// Remove a secret by name.
+    public func remove(name: String) throws {
+        var vault = try loadOrEmpty()
+        guard vault.entries.contains(where: { $0.name == name }) else {
+            throw FaceUnlockError.secretNotFound(name)
         }
-        try save(data)
+        vault.entries.removeAll { $0.name == name }
+        try persist(vault)
     }
 
-    // MARK: - Persistence
-
-    private func loadOrEmpty() throws -> VaultData {
-        guard FileManager.default.fileExists(atPath: filePath.path) else {
-            return VaultData()
-        }
-        let plaintext = try crypto.decryptFromFile(at: filePath)
-        do {
-            return try JSONDecoder().decode(VaultData.self, from: plaintext)
-        } catch {
-            throw VaultError.corruptVault
-        }
+    /// Whether the vault file exists.
+    public var exists: Bool {
+        FileManager.default.fileExists(atPath: fileURL.path)
     }
 
-    private func save(_ data: VaultData) throws {
-        let plaintext = try JSONEncoder().encode(data)
-        try crypto.encryptToFile(plaintext, at: filePath)
+    // MARK: - Private
+
+    private func loadOrEmpty() throws -> VaultFile {
+        guard exists else { return VaultFile(entries: []) }
+        let data = try crypto.decryptFromFile(at: fileURL)
+        return try JSONDecoder().decode(VaultFile.self, from: data)
+    }
+
+    private func persist(_ vault: VaultFile) throws {
+        let dir = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let data = try JSONEncoder().encode(vault)
+        try crypto.encryptToFile(data, at: fileURL)
     }
 }

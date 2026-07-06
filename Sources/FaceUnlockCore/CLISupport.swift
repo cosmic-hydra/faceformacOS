@@ -1,80 +1,102 @@
 import Foundation
 
-/// Tiny argument parser shared by the three CLIs (no external dependencies —
-/// the package must build offline with Command Line Tools only).
-public struct ParsedArgs {
-    public var flags: Set<String> = []
-    public var options: [String: String] = [:]
-    public var positionals: [String] = []
+/// Minimal flag/option parser shared by the faceunlock CLIs.
+/// (Deliberately tiny — avoids an external swift-argument-parser dependency
+/// so the tools build with just the Command Line Tools.)
+public struct CLIArguments {
+    public private(set) var positional: [String] = []
+    private var options: [String: String] = [:]
+    private var flags: Set<String> = []
 
-    public init() {}
-}
-
-public enum ArgParseError: Error, CustomStringConvertible {
-    case missingValue(String)
-    case unknownArgument(String)
-
-    public var description: String {
-        switch self {
-        case .missingValue(let name): return "missing value for \(name)"
-        case .unknownArgument(let name): return "unknown argument \(name)"
-        }
-    }
-}
-
-/// Parse `argv` (without the program name) into flags (`--foo`), options
-/// (`--foo value`) and positionals. Unknown `--` arguments are an error.
-public func parseCommandLine(
-    _ argv: [String],
-    flagNames: Set<String>,
-    optionNames: Set<String>
-) throws -> ParsedArgs {
-    var parsed = ParsedArgs()
-    var index = 0
-    while index < argv.count {
-        let arg = argv[index]
-        if flagNames.contains(arg) {
-            parsed.flags.insert(arg)
-        } else if optionNames.contains(arg) {
-            guard index + 1 < argv.count else {
-                throw ArgParseError.missingValue(arg)
+    /// Parse `arguments` (excluding argv[0]).
+    /// `knownFlags` are boolean switches; everything else starting with `--` expects a value.
+    public init(_ arguments: [String], knownFlags: Set<String>) {
+        var index = 0
+        while index < arguments.count {
+            let arg = arguments[index]
+            if arg.hasPrefix("--") {
+                let name = String(arg.dropFirst(2))
+                if knownFlags.contains(name) {
+                    flags.insert(name)
+                } else if let equals = name.firstIndex(of: "=") {
+                    options[String(name[..<equals])] = String(name[name.index(after: equals)...])
+                } else if index + 1 < arguments.count {
+                    options[name] = arguments[index + 1]
+                    index += 1
+                } else {
+                    options[name] = ""
+                }
+            } else {
+                positional.append(arg)
             }
             index += 1
-            parsed.options[arg] = argv[index]
-        } else if arg.hasPrefix("-") {
-            throw ArgParseError.unknownArgument(arg)
-        } else {
-            parsed.positionals.append(arg)
         }
-        index += 1
     }
-    return parsed
+
+    public func flag(_ name: String) -> Bool { flags.contains(name) }
+    public func string(_ name: String) -> String? { options[name] }
+
+    public func double(_ name: String) -> Double? {
+        options[name].flatMap(Double.init)
+    }
+
+    public func float(_ name: String) -> Float? {
+        options[name].flatMap(Float.init)
+    }
+
+    public func int(_ name: String) -> Int? {
+        options[name].flatMap(Int.init)
+    }
 }
 
-/// Write a line to stderr (stdout is reserved for machine-readable output —
-/// the PAM module parses the CLI's last stdout line).
+/// Shared exit codes across the faceunlock CLIs (consumed by pam_faceunlock).
+public enum FaceUnlockExitCode: Int32 {
+    case success = 0
+    case noMatch = 1
+    case notEnrolled = 2
+    case cameraError = 3
+    case modelMissing = 4
+    case usageError = 64   // EX_USAGE
+    case otherError = 70   // EX_SOFTWARE
+
+    /// Map a thrown error to the right exit code.
+    public static func from(_ error: Error) -> FaceUnlockExitCode {
+        guard let e = error as? FaceUnlockError else { return .otherError }
+        switch e {
+        case .notEnrolled, .enrollmentInvalid:
+            return .notEnrolled
+        case .cameraPermissionDenied, .cameraUnavailable, .cameraConfigurationFailed:
+            return .cameraError
+        case .modelNotFound, .modelLoadFailed, .weakEmbedderRefused:
+            return .modelMissing
+        case .timeout:
+            return .noMatch
+        default:
+            return .otherError
+        }
+    }
+}
+
+/// Print to stderr.
 public func printErr(_ message: String) {
-    FileHandle.standardError.write((message + "\n").data(using: .utf8) ?? Data())
+    FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
 }
 
-/// Read a secret from stdin. When stdin is a TTY, disables echo for the read.
+/// Read a line from the terminal with echo disabled (for secrets).
 public func readSecretLine(prompt: String) -> String? {
-    let fd = fileno(stdin)
-    guard isatty(fd) == 1 else {
-        return readLine(strippingNewline: true)
+    printErr(prompt)
+
+    var term = termios()
+    let hasTTY = tcgetattr(STDIN_FILENO, &term) == 0
+    if hasTTY {
+        var noEcho = term
+        noEcho.c_lflag &= ~UInt(ECHO)
+        tcsetattr(STDIN_FILENO, TCSANOW, &noEcho)
     }
-
-    FileHandle.standardError.write(prompt.data(using: .utf8) ?? Data())
-
-    var original = termios()
-    tcgetattr(fd, &original)
-    var noEcho = original
-    noEcho.c_lflag &= ~tcflag_t(ECHO)
-    tcsetattr(fd, TCSANOW, &noEcho)
     defer {
-        var restore = original
-        tcsetattr(fd, TCSANOW, &restore)
-        FileHandle.standardError.write("\n".data(using: .utf8) ?? Data())
+        if hasTTY {
+            tcsetattr(STDIN_FILENO, TCSANOW, &term)
+        }
     }
 
     return readLine(strippingNewline: true)

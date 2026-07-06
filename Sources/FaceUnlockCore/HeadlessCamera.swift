@@ -2,55 +2,29 @@ import AVFoundation
 import CoreVideo
 import Foundation
 
-/// Headless camera capture for the CLI tools and the PAM helper.
-///
-/// This is the GUI-free counterpart of FaceGate's `CameraManager`: no
-/// SwiftUI `@Published` state, no preview layer, no NSWorkspace, no display
-/// brightness tricks — just an `AVCaptureSession` with a video-data output
-/// that delivers `CVPixelBuffer`s to a callback on a background queue.
+/// Headless camera capture for CLI / daemon use: no AppKit, no preview layer,
+/// no brightness manipulation. Delivers BGRA frames via a callback on a
+/// background queue. Adapted from FaceGate-Mac's CameraManager.
 public final class HeadlessCamera: NSObject {
-    public enum CameraError: LocalizedError {
-        case permissionDenied
-        case permissionTimeout
-        case cameraUnavailable
-        case configurationFailed
+    private let session = AVCaptureSession()
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let queue = DispatchQueue(label: "com.faceformacos.camera", qos: .userInitiated)
 
-        public var errorDescription: String? {
-            switch self {
-            case .permissionDenied:
-                return "Camera access denied — grant it in System Settings → Privacy & Security → Camera (for the terminal app running this tool)"
-            case .permissionTimeout:
-                return "Timed out waiting for the camera permission decision"
-            case .cameraUnavailable:
-                return "No camera found on this Mac"
-            case .configurationFailed:
-                return "Failed to configure the camera capture session"
-            }
-        }
-    }
-
-    /// Called with every captured frame, on `processingQueue`.
+    /// Invoked for every captured frame (on the capture queue).
     public var onFrame: ((CVPixelBuffer) -> Void)?
 
-    private let captureSession = AVCaptureSession()
-    private let videoOutput = AVCaptureVideoDataOutput()
-    private let processingQueue = DispatchQueue(label: "com.faceformacos.camera", qos: .userInitiated)
-    private var configured = false
+    /// Optional unique ID of a preferred camera device.
+    private let preferredCameraID: String?
 
-    /// Optional unique ID of the camera to use (`FACEUNLOCK_CAMERA_ID` env
-    /// var or `--camera` flag); defaults to the built-in camera.
-    public var preferredCameraID: String?
-
-    public override init() {
+    public init(preferredCameraID: String? = nil) {
+        self.preferredCameraID = preferredCameraID
         super.init()
-        preferredCameraID = ProcessInfo.processInfo.environment["FACEUNLOCK_CAMERA_ID"]
     }
 
     // MARK: - Permission
 
-    /// Ensure camera permission, blocking (up to `timeout`) on the system
-    /// prompt when authorization is not yet determined.
-    public func ensurePermission(timeout: TimeInterval = 30) throws {
+    /// Synchronously ensure camera permission, prompting if undetermined.
+    public static func ensurePermission() throws {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             return
@@ -61,109 +35,114 @@ public final class HeadlessCamera: NSObject {
                 granted = ok
                 semaphore.signal()
             }
-            guard semaphore.wait(timeout: .now() + timeout) == .success else {
-                throw CameraError.permissionTimeout
-            }
-            guard granted else { throw CameraError.permissionDenied }
+            semaphore.wait()
+            guard granted else { throw FaceUnlockError.cameraPermissionDenied }
         case .denied, .restricted:
-            throw CameraError.permissionDenied
+            throw FaceUnlockError.cameraPermissionDenied
         @unknown default:
-            throw CameraError.permissionDenied
+            throw FaceUnlockError.cameraPermissionDenied
         }
     }
 
-    // MARK: - Start / Stop
+    // MARK: - Device discovery
 
-    /// Configure (once) and start the session. Throws if no camera or the
-    /// session can't be built. Frames start flowing to `onFrame`.
-    public func start() throws {
-        if !configured {
-            try configureSession()
-            configured = true
-        }
-        if !captureSession.isRunning {
-            captureSession.startRunning()
-        }
-    }
-
-    public func stop() {
-        if captureSession.isRunning {
-            captureSession.stopRunning()
-        }
-    }
-
-    /// Block until any in-flight `onFrame` callback has finished, so callers
-    /// can safely read state the callback mutates. Call after `stop()`.
-    public func drain() {
-        processingQueue.sync {}
-    }
-
-    // MARK: - Configuration
-
-    private func resolveCamera() -> AVCaptureDevice? {
-        let discovery = AVCaptureDevice.DiscoverySession(
+    /// All available video capture devices (external first).
+    public static func availableCameras() -> [AVCaptureDevice] {
+        var cameras = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.builtInWideAngleCamera, .external],
             mediaType: .video,
             position: .unspecified
-        )
-        let cameras = discovery.devices
-
-        if let preferredID = preferredCameraID,
-           let match = cameras.first(where: { $0.uniqueID == preferredID }) {
-            return match
-        }
-        // Built-in first — for login-style auth the user faces the laptop.
-        return cameras.first(where: { $0.deviceType == .builtInWideAngleCamera })
-            ?? cameras.first
+        ).devices
+        cameras.sort { $0.deviceType == .external && $1.deviceType != .external }
+        return cameras
     }
 
-    private func configureSession() throws {
-        captureSession.beginConfiguration()
-        defer { captureSession.commitConfiguration() }
+    private func resolveCamera() -> AVCaptureDevice? {
+        let cameras = Self.availableCameras()
+        if let preferredCameraID,
+           let match = cameras.first(where: { $0.uniqueID == preferredCameraID }) {
+            return match
+        }
+        // Prefer the built-in camera for auth (predictable placement), else anything.
+        return cameras.first(where: { $0.deviceType == .builtInWideAngleCamera }) ?? cameras.first
+    }
 
-        // 720p is plenty for detection + a 112×112 embed, and keeps Vision fast.
-        if captureSession.canSetSessionPreset(.hd1280x720) {
-            captureSession.sessionPreset = .hd1280x720
-        } else if captureSession.canSetSessionPreset(.high) {
-            captureSession.sessionPreset = .high
+    // MARK: - Lifecycle
+
+    /// Configure and start the capture session.
+    public func start() throws {
+        try Self.ensurePermission()
+
+        session.beginConfiguration()
+
+        if session.canSetSessionPreset(.hd1280x720) {
+            session.sessionPreset = .hd1280x720
+        } else if session.canSetSessionPreset(.high) {
+            session.sessionPreset = .high
+        } else {
+            session.sessionPreset = .medium
         }
 
         guard let camera = resolveCamera() else {
-            throw CameraError.cameraUnavailable
+            session.commitConfiguration()
+            throw FaceUnlockError.cameraUnavailable
         }
 
         do {
             let input = try AVCaptureDeviceInput(device: camera)
-            guard captureSession.canAddInput(input) else {
-                throw CameraError.configurationFailed
+            guard session.canAddInput(input) else {
+                session.commitConfiguration()
+                throw FaceUnlockError.cameraConfigurationFailed
             }
-            captureSession.addInput(input)
-        } catch let error as CameraError {
+            session.addInput(input)
+        } catch let error as FaceUnlockError {
             throw error
         } catch {
-            throw CameraError.configurationFailed
+            session.commitConfiguration()
+            throw FaceUnlockError.cameraConfigurationFailed
         }
 
-        videoOutput.setSampleBufferDelegate(self, queue: processingQueue)
+        videoOutput.setSampleBufferDelegate(self, queue: queue)
         videoOutput.alwaysDiscardsLateVideoFrames = true
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
 
-        guard captureSession.canAddOutput(videoOutput) else {
-            throw CameraError.configurationFailed
+        guard session.canAddOutput(videoOutput) else {
+            session.commitConfiguration()
+            throw FaceUnlockError.cameraConfigurationFailed
         }
-        captureSession.addOutput(videoOutput)
-        // No mirroring: the pipeline is orientation-agnostic (the head-turn
-        // challenge is direction-agnostic), and un-mirrored frames keep the
-        // yaw sign consistent with enrollment.
+        session.addOutput(videoOutput)
+
+        // Mirror so "turn left" instructions feel natural, matching the GUI app.
+        if let connection = videoOutput.connection(with: .video), connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = true
+        }
+
+        session.commitConfiguration()
+        session.startRunning()
+    }
+
+    /// Stop the capture session and release the camera.
+    public func stop() {
+        onFrame = nil
+        if session.isRunning {
+            session.stopRunning()
+        }
+    }
+
+    deinit {
+        stop()
     }
 }
 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
 
 extension HeadlessCamera: AVCaptureVideoDataOutputSampleBufferDelegate {
-    public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    public func captureOutput(_ output: AVCaptureOutput,
+                              didOutput sampleBuffer: CMSampleBuffer,
+                              from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         onFrame?(pixelBuffer)
     }

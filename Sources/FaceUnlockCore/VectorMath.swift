@@ -1,12 +1,10 @@
 import Accelerate
 import Foundation
 
-/// High-performance vector math operations using the Accelerate framework (vDSP).
-/// Used for cosine similarity and L2 distance comparisons between face embeddings.
-/// (Ported unchanged from FaceGate.)
+/// High-performance vector math using Accelerate (vDSP).
+/// Ported from FaceGate-Mac.
 public enum VectorMath {
-    /// Compute the cosine similarity between two vectors.
-    /// Returns a value between -1.0 (opposite) and 1.0 (identical).
+    /// Cosine similarity between two vectors: -1.0 (opposite) … 1.0 (identical).
     public static func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
         guard a.count == b.count, !a.isEmpty else { return -1.0 }
 
@@ -25,20 +23,19 @@ public enum VectorMath {
         return dotProduct / (magnitudeA * magnitudeB)
     }
 
-    /// Compute the L2 (Euclidean) distance between two vectors.
+    /// Euclidean (L2) distance between two vectors.
     public static func euclideanDistance(_ a: [Float], _ b: [Float]) -> Float {
-        guard a.count == b.count, !a.isEmpty else { return Float.infinity }
+        guard a.count == b.count, !a.isEmpty else { return .infinity }
 
         var diff = [Float](repeating: 0, count: a.count)
         vDSP_vsub(b, 1, a, 1, &diff, 1, vDSP_Length(a.count))
 
         var sumOfSquares: Float = 0
         vDSP_svesq(diff, 1, &sumOfSquares, vDSP_Length(diff.count))
-
         return sqrt(sumOfSquares)
     }
 
-    /// Normalize a vector to unit length (L2 normalization).
+    /// L2-normalize a vector to unit length. Returns the input unchanged if magnitude is zero.
     public static func normalize(_ vector: [Float]) -> [Float] {
         var magnitudeSquared: Float = 0
         vDSP_svesq(vector, 1, &magnitudeSquared, vDSP_Length(vector.count))

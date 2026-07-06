@@ -1,237 +1,152 @@
 import CoreVideo
 import Foundation
 
-/// Options for a verification run.
-public struct VerifyOptions {
-    /// Account whose enrollment to verify against (nil = current user).
-    public var user: String?
-    public var timeout: TimeInterval = FUConstants.defaultVerifyTimeout
-    public var threshold: Float = FUConstants.defaultFaceUnlockThreshold
-    /// Require the 2D liveness signals (blink + micro-motion).
-    public var requireLiveness = false
-    /// Additionally require the head-turn challenge (implies liveness).
-    public var challenge = false
-    /// Override the Core ML model location (defaults to the per-user copy).
-    public var modelPath: URL?
-    /// Override the capture device by unique ID.
-    public var cameraID: String?
-    /// Matching frames needed before success.
-    public var requiredMatchFrames = FUConstants.requiredMatchFrames
-    /// Minimum Vision capture quality for a frame to count.
-    public var minQuality: Float = FUConstants.minimumCaptureQuality
-    /// Progress messages (suitable for stderr / UI status lines).
-    public var onStatus: ((String) -> Void)?
+/// Headless face verification orchestrator:
+/// camera → detect → embed → match → liveness, within a timeout.
+/// Runs synchronously (designed for CLIs and the PAM helper).
+public final class FaceVerifier {
+    public struct Options {
+        public var timeout: TimeInterval
+        public var threshold: Float
+        public var livenessMode: LivenessMode
+        public var modelPath: String?
+        public var cameraID: String?
+        public var dataDir: URL
 
-    public init() {}
-}
-
-/// Result of a verification run. Maps 1:1 onto the CLI/PAM exit contract:
-/// match → 0, noMatch → 1, error → 2.
-public enum VerifyOutcome {
-    case match(score: Float)
-    case noMatch(bestScore: Float, reason: String)
-    case error(String)
-
-    public var exitCode: Int32 {
-        switch self {
-        case .match: return 0
-        case .noMatch: return 1
-        case .error: return 2
+        public init(timeout: TimeInterval = FaceUnlockConfig.defaultVerifyTimeout,
+                    threshold: Float = FaceUnlockConfig.defaultMatchThreshold,
+                    livenessMode: LivenessMode = .auto,
+                    modelPath: String? = nil,
+                    cameraID: String? = nil,
+                    dataDir: URL = FaceUnlockConfig.dataDirectory()) {
+            self.timeout = timeout
+            self.threshold = threshold
+            self.livenessMode = livenessMode
+            self.modelPath = modelPath
+            self.cameraID = cameraID
+            self.dataDir = dataDir
         }
     }
-}
 
-/// Runs the live verification pipeline:
-/// camera → detect (single-face + quality gates) → liveness → embed → match,
-/// looping frames until enough matches accumulate or the timeout expires.
-///
-/// `run()` blocks the calling thread (spinning its RunLoop so framework
-/// callbacks stay serviced) and is intended to be called from `main`.
-public final class FaceVerifier {
-    private let options: VerifyOptions
+    public struct Outcome {
+        public let matched: Bool
+        public let bestSimilarity: Float
+        public let livenessPassed: Bool
+        public let elapsed: TimeInterval
+    }
 
-    // Mutable pipeline state, touched only on the camera queue…
-    private var matchFrameCount = 0
-    private var bestScore: Float = -1.0
-    private var sawFace = false
-    private var sawMultipleFaces = false
-    private var lastStatus = ""
+    /// Progress callback: human-readable status updates ("Looking for your face…", challenge prompts).
+    public var onStatus: ((String) -> Void)?
 
-    // …except these two, which the runloop thread polls under `stateLock`.
-    private let stateLock = NSLock()
-    private var finished = false
-    private var succeeded = false
+    private let options: Options
 
-    public init(options: VerifyOptions) {
+    public init(options: Options) {
         self.options = options
     }
 
-    public func run() -> VerifyOutcome {
-        // 1. Load the enrollment template.
-        let store = FaceStore(user: options.user)
-        let enrollment: FaceEnrollment
-        do {
-            enrollment = try store.loadEnrollment()
-        } catch {
-            return .error(error.localizedDescription)
-        }
+    /// Run verification. Blocks until match+liveness succeed or the timeout expires.
+    /// - Throws: setup errors (`notEnrolled`, `modelNotFound`, camera errors).
+    /// - Returns: the outcome; `matched && livenessPassed` means authentication succeeded.
+    public func verify() throws -> Outcome {
+        // 1. Load enrollment.
+        let store = EnrollmentStore(dataDir: options.dataDir)
+        let enrollment = try store.load()
+        guard enrollment.isValid else { throw FaceUnlockError.enrollmentInvalid }
         let enrolledEmbeddings = enrollment.allEmbeddings
-        guard enrollment.isValid, !enrolledEmbeddings.isEmpty else {
-            return .error("Enrollment exists but is invalid — re-run faceunlock-enroll")
-        }
 
-        // 2. Load the embedding model.
-        let modelURL = options.modelPath ?? FUConstants.modelPath(forUser: options.user)
-        let embedder: FaceEmbedder
-        do {
-            embedder = try FaceEmbedder(modelURL: modelURL)
-        } catch {
-            return .error(error.localizedDescription)
-        }
+        // 2. Load model (throws when missing, unless weak fallback is explicitly allowed).
+        let embedder = try FaceEmbedder(modelPath: options.modelPath)
 
+        // 3. Set up pipeline.
         let detector = FaceDetector()
         let matcher = FaceMatcher(threshold: options.threshold)
-        let livenessRequired = options.requireLiveness || options.challenge
-        let liveness = LivenessDetector(mode: options.challenge ? .challenge : .passive)
+        let liveness = LivenessDetector(mode: options.livenessMode)
 
-        // 3. Camera.
-        let camera = HeadlessCamera()
-        if let id = options.cameraID { camera.preferredCameraID = id }
-        do {
-            try camera.ensurePermission()
-        } catch {
-            return .error(error.localizedDescription)
-        }
+        let camera = HeadlessCamera(preferredCameraID: options.cameraID)
+        let done = DispatchSemaphore(value: 0)
+        let stateQueue = DispatchQueue(label: "com.faceformacos.verify.state")
 
-        camera.onFrame = { [weak self] pixelBuffer in
-            guard let self else { return }
-            // The camera queue is serial and drops late frames, so frames
-            // process strictly one at a time.
-            self.process(
-                pixelBuffer: pixelBuffer,
-                detector: detector,
-                embedder: embedder,
-                matcher: matcher,
-                liveness: liveness,
-                livenessRequired: livenessRequired,
-                enrolledEmbeddings: enrolledEmbeddings
-            )
-        }
+        var bestSimilarity: Float = -1
+        var consecutiveMatches = 0
+        var finished = false
+        var frameCounter = 0
+        let start = Date()
 
-        do {
-            try camera.start()
-        } catch {
-            return .error(error.localizedDescription)
-        }
-        status("Looking for your face…")
+        // Process every Nth frame for performance (matches FaceGate's cadence).
+        let processEveryNFrames = 3
 
-        // 4. Spin the runloop until success or deadline.
-        let deadline = Date().addingTimeInterval(options.timeout)
-        while Date() < deadline && !isFinished {
-            let tick = Date(timeIntervalSinceNow: 0.05)
-            if !RunLoop.current.run(mode: .default, before: tick) {
-                // No runloop sources registered — plain sleep instead.
-                Thread.sleep(until: tick)
+        camera.onFrame = { [weak camera] pixelBuffer in
+            stateQueue.sync {
+                guard !finished else { return }
+                frameCounter += 1
+                guard frameCounter % processEveryNFrames == 0 else { return }
+
+                let faces = detector.detectFaces(in: pixelBuffer)
+
+                // Exactly one face for security.
+                guard faces.count == 1, let face = faces.first else {
+                    if faces.count > 1 {
+                        self.onStatus?("Only one face allowed")
+                    } else {
+                        self.onStatus?("Looking for your face…")
+                    }
+                    consecutiveMatches = 0
+                    return
+                }
+
+                guard let cropped = detector.cropFace(from: pixelBuffer, observation: face.observation),
+                      let liveEmbedding = embedder.generateEmbedding(from: cropped) else {
+                    return
+                }
+
+                let result = matcher.match(liveEmbedding: liveEmbedding, against: enrolledEmbeddings)
+                bestSimilarity = max(bestSimilarity, result.bestSimilarity)
+
+                guard result.isMatch else {
+                    consecutiveMatches = 0
+                    self.onStatus?("Face not recognized yet…")
+                    return
+                }
+
+                consecutiveMatches += 1
+                guard consecutiveMatches >= FaceUnlockConfig.requiredConsecutiveMatches else { return }
+
+                // Face matches — run the liveness challenge.
+                if liveness.challenge == nil, self.options.livenessMode != .none {
+                    liveness.activateChallenge()
+                    if let prompt = liveness.challenge?.prompt {
+                        self.onStatus?("Liveness check: \(prompt)")
+                    }
+                }
+
+                if liveness.process(yaw: face.yaw, eyeAspectRatio: face.eyeAspectRatio) {
+                    finished = true
+                    camera?.onFrame = nil
+                    done.signal()
+                }
             }
         }
 
-        camera.onFrame = nil
-        camera.stop()
-        camera.drain()   // flush any in-flight frame callback before reading state
+        try camera.start()
+        defer { camera.stop() }
+        onStatus?("Looking for your face…")
 
-        // 5. Verdict.
-        stateLock.lock()
-        let didSucceed = succeeded
-        stateLock.unlock()
+        let waitResult = done.wait(timeout: .now() + options.timeout)
+        let elapsed = Date().timeIntervalSince(start)
 
-        if didSucceed {
-            return .match(score: bestScore)
-        }
-        if !sawFace {
-            let hint = sawMultipleFaces
-                ? "multiple faces in view"
-                : "no usable face detected within the timeout"
-            return .noMatch(bestScore: bestScore, reason: hint)
-        }
-        if matchFrameCount >= options.requiredMatchFrames && livenessRequired && !liveness.isSatisfied {
-            return .noMatch(bestScore: bestScore, reason: "face matched but liveness checks did not pass")
-        }
-        return .noMatch(bestScore: bestScore, reason: "similarity below threshold \(options.threshold)")
-    }
-
-    // MARK: - Per-frame pipeline (camera queue)
-
-    private func process(
-        pixelBuffer: CVPixelBuffer,
-        detector: FaceDetector,
-        embedder: FaceEmbedder,
-        matcher: FaceMatcher,
-        liveness: LivenessDetector,
-        livenessRequired: Bool,
-        enrolledEmbeddings: [[Float]]
-    ) {
-        guard !isFinished else { return }
-
-        let faces = detector.detectFaces(in: pixelBuffer)
-
-        // Gate: exactly one face in frame.
-        guard faces.count == 1, let face = faces.first else {
-            if faces.count > 1 {
-                sawMultipleFaces = true
-                status("More than one face in view — make sure you're alone in frame")
-            }
-            return
-        }
-
-        // Gate: capture quality.
-        guard face.quality >= options.minQuality else { return }
-        sawFace = true
-
-        // Liveness accumulates evidence on every good frame.
-        liveness.process(face: face)
-
-        // Embed + match.
-        guard let cropped = detector.cropFace(from: pixelBuffer, observation: face.observation),
-              let embedding = embedder.generateEmbedding(from: cropped)
-        else { return }
-
-        let result = matcher.match(liveEmbedding: embedding, against: enrolledEmbeddings)
-        if result.bestSimilarity > bestScore {
-            bestScore = result.bestSimilarity
-        }
-        if result.isMatch {
-            matchFrameCount += 1
-        }
-
-        let matched = matchFrameCount >= options.requiredMatchFrames
-        if matched && livenessRequired && !liveness.isSatisfied {
-            if let instruction = liveness.pendingInstruction {
-                status("Face matched — \(instruction)")
-            }
-            return
-        }
-        if matched {
-            status(String(format: "Match (similarity %.2f)", bestScore))
-            stateLock.lock()
-            succeeded = true
+        var sawMatch = false
+        var livenessOK = false
+        var similarity: Float = -1
+        stateQueue.sync {
             finished = true
-            stateLock.unlock()
-        } else if result.isMatch {
-            status("Verifying…")
+            sawMatch = consecutiveMatches >= FaceUnlockConfig.requiredConsecutiveMatches
+            livenessOK = liveness.isSatisfied
+            similarity = bestSimilarity
         }
-    }
 
-    // MARK: - Helpers
-
-    private var isFinished: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return finished
-    }
-
-    private func status(_ message: String) {
-        guard message != lastStatus else { return }
-        lastStatus = message
-        options.onStatus?(message)
+        if waitResult == .success {
+            return Outcome(matched: true, bestSimilarity: similarity, livenessPassed: true, elapsed: elapsed)
+        }
+        return Outcome(matched: sawMatch, bestSimilarity: similarity, livenessPassed: livenessOK, elapsed: elapsed)
     }
 }

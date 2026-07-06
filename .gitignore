@@ -16,10 +16,6 @@ Icon
 # Thumbnails
 ._*
 
-# SwiftPM / PAM build artifacts
-.build/
-pam/*.so
-
 # Files that might be created by Xcode
 *.mode1v3
 *.mode2v3

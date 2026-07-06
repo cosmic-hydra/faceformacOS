@@ -2,47 +2,58 @@ import CoreImage
 import Foundation
 import Vision
 
-/// A face found in a frame, with everything downstream stages need:
-/// bounding box, capture quality, 2D landmarks (for blink detection), and
-/// head pose (for the head-turn challenge and enrollment pose diversity).
+/// A detected face with the signals the pipeline needs downstream.
 public struct DetectedFace {
+    /// Vision observation (normalized bounding box, origin bottom-left).
     public let observation: VNFaceObservation
-    /// Vision capture-quality score, 0–1 (0.5 when unavailable).
-    public let quality: Float
-    /// Landmarks (eyes, nose, …) in normalized coordinates, if resolved.
-    public let landmarks: VNFaceLandmarks2D?
-    /// Head yaw in radians (negative/positive = turned to either side).
+    /// Head yaw in radians (negative = turned left in the mirrored view), 0 if unavailable.
     public let yaw: Float
-    /// Head pitch in radians.
-    public let pitch: Float
-    /// Head roll in radians.
-    public let roll: Float
-
-    public var boundingBox: CGRect { observation.boundingBox }
+    /// Eye aspect ratio (average of both eyes), or nil when landmarks are unavailable.
+    /// Low values (< ~0.16) indicate closed eyes.
+    public let eyeAspectRatio: Float?
 }
 
-/// Detects faces in video frames using Apple's Vision framework.
-/// Ported from FaceGate and extended: one synchronous call now returns
-/// landmarks + head pose + quality, which the liveness detector consumes.
+/// Detects faces in video frames using Vision.
+/// Ported from FaceGate-Mac, extended with landmark-based eye-aspect-ratio
+/// extraction to support blink liveness in the headless pipeline.
 public final class FaceDetector {
     public init() {}
 
-    /// Detect faces (with landmarks, pose and quality) in a pixel buffer.
-    /// Synchronous — call from a background queue.
+    /// Detect faces with landmarks (for blink detection) in a pixel buffer. Synchronous.
     public func detectFaces(in pixelBuffer: CVPixelBuffer) -> [DetectedFace] {
-        let landmarksRequest = VNDetectFaceLandmarksRequest()
-        let qualityRequest = VNDetectFaceCaptureQualityRequest()
+        let request = VNDetectFaceLandmarksRequest()
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         do {
-            try handler.perform([landmarksRequest, qualityRequest])
+            try handler.perform([request])
         } catch {
             return []
         }
 
-        guard let faceResults = landmarksRequest.results, !faceResults.isEmpty else {
+        guard let results = request.results else { return [] }
+
+        return results.map { face in
+            DetectedFace(
+                observation: face,
+                yaw: face.yaw.map { Float(truncating: $0) } ?? 0,
+                eyeAspectRatio: Self.eyeAspectRatio(for: face)
+            )
+        }
+    }
+
+    /// Detect faces with Vision capture-quality scores — used during enrollment to filter poor frames.
+    public func detectFacesWithQuality(in pixelBuffer: CVPixelBuffer) -> [(face: VNFaceObservation, quality: Float)] {
+        let faceRequest = VNDetectFaceRectanglesRequest()
+        let qualityRequest = VNDetectFaceCaptureQualityRequest()
+
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        do {
+            try handler.perform([faceRequest, qualityRequest])
+        } catch {
             return []
         }
+
+        guard let faceResults = faceRequest.results else { return [] }
         let qualityResults = qualityRequest.results ?? []
 
         return faceResults.enumerated().map { index, face in
@@ -52,33 +63,15 @@ public final class FaceDetector {
             } else {
                 quality = 0.5
             }
-
-            // Prefer Vision's pose estimates; fall back to a geometric
-            // estimate from landmarks when Vision doesn't populate them.
-            let yaw = face.yaw.map { Float(truncating: $0) }
-                ?? Self.estimateYaw(from: face.landmarks)
-            let pitch = face.pitch.map { Float(truncating: $0) }
-                ?? Self.estimatePitch(from: face.landmarks)
-            let roll = face.roll.map { Float(truncating: $0) } ?? 0
-
-            return DetectedFace(
-                observation: face,
-                quality: quality,
-                landmarks: face.landmarks,
-                yaw: yaw,
-                pitch: pitch,
-                roll: roll
-            )
+            return (face: face, quality: quality)
         }
     }
 
-    /// Crop the detected face region from a pixel buffer, with padding for
-    /// better embedding quality. (Ported unchanged from FaceGate.)
+    /// Crop the detected face from a frame with padding for better embedding quality.
     public func cropFace(from pixelBuffer: CVPixelBuffer, observation: VNFaceObservation, padding: CGFloat = 0.2) -> CGImage? {
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let imageSize = ciImage.extent.size
 
-        // Convert normalized Vision coordinates (0–1, origin bottom-left) to pixels.
         let boundingBox = observation.boundingBox
         var faceRect = CGRect(
             x: boundingBox.origin.x * imageSize.width,
@@ -90,7 +83,6 @@ public final class FaceDetector {
         let padX = faceRect.width * padding
         let padY = faceRect.height * padding
         faceRect = faceRect.insetBy(dx: -padX, dy: -padY)
-
         faceRect = faceRect.intersection(ciImage.extent)
         guard !faceRect.isEmpty else { return nil }
 
@@ -99,60 +91,41 @@ public final class FaceDetector {
         return context.createCGImage(croppedCI, from: croppedCI.extent)
     }
 
-    // MARK: - Geometric pose fallback
+    // MARK: - Eye Aspect Ratio
 
-    /// Rough yaw estimate from the horizontal offset of the nose relative to
-    /// the midpoint of the eyes. Only used when Vision omits `yaw`.
-    static func estimateYaw(from landmarks: VNFaceLandmarks2D?) -> Float {
-        guard let landmarks,
-              let leftEye = landmarks.leftEye?.normalizedPoints, !leftEye.isEmpty,
-              let rightEye = landmarks.rightEye?.normalizedPoints, !rightEye.isEmpty,
-              let nosePoints = (landmarks.noseCrest ?? landmarks.nose)?.normalizedPoints,
-              !nosePoints.isEmpty
-        else { return 0 }
+    /// Average eye aspect ratio (eye height / eye width) across both eyes.
+    /// Typical open-eye values are 0.25–0.35; a blink dips below ~0.16.
+    static func eyeAspectRatio(for face: VNFaceObservation) -> Float? {
+        guard let landmarks = face.landmarks else { return nil }
 
-        let leftCenter = Self.centroid(of: leftEye)
-        let rightCenter = Self.centroid(of: rightEye)
-        let noseCenter = Self.centroid(of: nosePoints)
-
-        let eyeMidX = (leftCenter.x + rightCenter.x) / 2
-        let eyeSpan = abs(rightCenter.x - leftCenter.x)
-        guard eyeSpan > 0.001 else { return 0 }
-
-        // Nose offset as a fraction of the inter-eye span, scaled to a
-        // radian-ish range. Sign convention matches "offset to one side".
-        let offset = Float((noseCenter.x - eyeMidX) / eyeSpan)
-        return offset * 1.2
-    }
-
-    /// Rough pitch estimate from the vertical position of the nose between
-    /// the eyes and the outline bottom. Only used when Vision omits `pitch`.
-    static func estimatePitch(from landmarks: VNFaceLandmarks2D?) -> Float {
-        guard let landmarks,
-              let leftEye = landmarks.leftEye?.normalizedPoints, !leftEye.isEmpty,
-              let rightEye = landmarks.rightEye?.normalizedPoints, !rightEye.isEmpty,
-              let nosePoints = (landmarks.noseCrest ?? landmarks.nose)?.normalizedPoints,
-              !nosePoints.isEmpty
-        else { return 0 }
-
-        let eyeMidY = (Self.centroid(of: leftEye).y + Self.centroid(of: rightEye).y) / 2
-        let noseY = Self.centroid(of: nosePoints).y
-
-        // Neutral head pose puts the nose a fairly stable distance below the
-        // eyes (in normalized face space). Deviations approximate pitch.
-        let neutralDrop: CGFloat = 0.25
-        let drop = eyeMidY - noseY
-        return Float((drop - neutralDrop) * 2.0)
-    }
-
-    private static func centroid(of points: [CGPoint]) -> CGPoint {
-        var sumX: CGFloat = 0
-        var sumY: CGFloat = 0
-        for p in points {
-            sumX += p.x
-            sumY += p.y
+        var ratios: [Float] = []
+        for eye in [landmarks.leftEye, landmarks.rightEye].compactMap({ $0 }) {
+            if let ratio = aspectRatio(of: eye.normalizedPoints) {
+                ratios.append(ratio)
+            }
         }
-        let n = CGFloat(points.count)
-        return CGPoint(x: sumX / n, y: sumY / n)
+
+        guard !ratios.isEmpty else { return nil }
+        return ratios.reduce(0, +) / Float(ratios.count)
+    }
+
+    /// Height/width ratio of an eye contour given its normalized landmark points.
+    private static func aspectRatio(of points: [CGPoint]) -> Float? {
+        guard points.count >= 4 else { return nil }
+
+        var minX = CGFloat.greatestFiniteMagnitude
+        var maxX = -CGFloat.greatestFiniteMagnitude
+        var minY = CGFloat.greatestFiniteMagnitude
+        var maxY = -CGFloat.greatestFiniteMagnitude
+
+        for p in points {
+            minX = min(minX, p.x); maxX = max(maxX, p.x)
+            minY = min(minY, p.y); maxY = max(maxY, p.y)
+        }
+
+        let width = maxX - minX
+        let height = maxY - minY
+        guard width > 0 else { return nil }
+        return Float(height / width)
     }
 }
