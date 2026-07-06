@@ -56,7 +56,7 @@ dmg: export
 	@cp -R $(APP_PATH) $(BUILD_DIR)/dmg_staging/
 	create-dmg \
 		--volname "$(APP_NAME)" \
-		--background "non-app-assets/dmg_background.png" \
+		$(if $(wildcard non-app-assets/dmg_background.png),--background "non-app-assets/dmg_background.png") \
 		--window-pos 200 120 \
 		--window-size 660 400 \
 		--icon-size 100 \

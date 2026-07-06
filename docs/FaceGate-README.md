@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="non-app-assets/logos/square_icon.png" width="128" alt="FaceGate Logo"/>
+  <img src="https://raw.githubusercontent.com/dweep-desai/FaceGate-Mac/main/non-app-assets/logos/square_icon.png" width="128" alt="FaceGate Logo"/>
 </p>
 
 <h1 align="center">FaceGate</h1>
@@ -16,12 +16,12 @@
 </p>
 
 <p align="center">
-  <img src="non-app-assets/logos/banner.png" alt="FaceGate Banner" width="100%"/>
+  <img src="https://raw.githubusercontent.com/dweep-desai/FaceGate-Mac/main/non-app-assets/logos/banner.png" alt="FaceGate Banner" width="100%"/>
 </p>
 
 <p align="center">
   <a href="https://dweep-desai.github.io/FaceGate-web/" target="_blank" rel="noopener noreferrer">
-    <img src="non-app-assets/website.svg" alt="Website" height="16" />
+    <img src="https://raw.githubusercontent.com/dweep-desai/FaceGate-Mac/main/non-app-assets/website.svg" alt="Website" height="16" />
   </a>
 </p>
 

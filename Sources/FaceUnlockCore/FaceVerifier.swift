@@ -3,7 +3,7 @@ import Foundation
 
 /// Headless face verification orchestrator:
 /// camera → detect → embed → match → liveness, within a timeout.
-/// Runs synchronously (designed for CLIs and the PAM helper).
+/// Runs synchronously (designed for CLIs and scripting).
 public final class FaceVerifier {
     public struct Options {
         public var timeout: TimeInterval

@@ -49,7 +49,7 @@ public struct CLIArguments {
     }
 }
 
-/// Shared exit codes across the faceunlock CLIs (consumed by pam_faceunlock).
+/// Shared exit codes across the faceunlock CLIs (stable for scripting).
 public enum FaceUnlockExitCode: Int32 {
     case success = 0
     case noMatch = 1

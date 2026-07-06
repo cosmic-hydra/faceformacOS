@@ -9,7 +9,7 @@ usage: faceunlock-verify [options]
 
 Verifies the person at the camera against the enrolled face templates.
 Exits 0 on a match (with liveness), non-zero otherwise — suitable for
-scripting and for the pam_faceunlock module.
+scripting.
 
 options:
   --timeout <seconds>    give up after this long (default 10)
@@ -18,7 +18,7 @@ options:
   --data-dir <path>      enrollment data directory (default ~/Library/Application Support/faceunlock)
   --model <path>         path to FaceEmbedding.mlmodelc
   --camera <unique-id>   use a specific camera (see faceunlock-enroll --list-cameras)
-  --quiet                no status output (for PAM / scripts)
+  --quiet                no status output (for scripts)
   --json                 print a JSON result to stdout
   --help                 show this help
 
