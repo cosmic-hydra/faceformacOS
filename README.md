@@ -2,7 +2,7 @@
 
 **Face ID–style authentication for macOS** — unlock `sudo` / the lock screen with your face, and use a face-gated credential vault as a password-autofill / passkey alternative. On-device, offline, no telemetry.
 
-> ⚠️ **Status: work in progress.** This initial commit contains the project design and scaffolding. The Swift/C source is being generated and integrated next.
+Face auth gets **2 attempts** (each a fresh camera window with a new liveness challenge), then gives up and falls back to your normal password. The limit is configurable (`attempts=` in the PAM line, `--attempts` on the CLI), capped at 5.
 
 ---
 
@@ -51,13 +51,44 @@ macOS has Touch ID but no built-in facial unlock. This project adds one, reusing
 - A built-in or external camera.
 - A **Core ML face-embedding model** for real recognition (see Limitations).
 
-## Build (once source lands)
+## Install
 
 ```bash
-swift build -c release        # builds FaceUnlockCore + the three CLIs
-make -C pam                    # builds the PAM module with clang
-sudo ./scripts/install.sh      # installs binaries + wires /etc/pam.d (with backups)
+sudo ./scripts/install.sh      # builds everything, installs binaries + model,
+                               # wires /etc/pam.d (with backups)
+faceunlock-enroll              # register your face (as your normal user)
+faceunlock-verify              # test it: 2 attempts, then it gives up
+sudo -k true                   # in a NEW terminal: face prompt, then password
 ```
+
+The installer wires face auth into `sudo` via `/etc/pam.d/sudo_local` (macOS 14+'s
+update-safe hook) as `sufficient`, so the password path is never removed:
+
+```
+auth       sufficient     pam_faceunlock.so attempts=2 timeout=10
+```
+
+Add `--screensaver` to also wire the lock screen (read the caveats below first),
+`--attempts N` / `--timeout S` to tune the limits, and `--uninstall` to cleanly
+remove everything. To build manually instead:
+
+```bash
+swift build -c release         # builds FaceUnlockCore + the three CLIs
+make -C pam                    # builds the PAM module with clang
+```
+
+### How the 2-attempt limit works
+
+- `faceunlock-verify` runs up to 2 verification attempts (default, `--attempts`).
+  Each attempt is one camera window (10 s default) that must end in a face match
+  **plus** a passed liveness challenge; every attempt draws a fresh random challenge.
+- `pam_faceunlock` passes `attempts=2` through to the helper and enforces a hard
+  watchdog (`attempts × timeout + 10 s`) — if the helper hangs it is killed and
+  PAM moves on to password auth.
+- After the attempts are exhausted the module returns failure and, because it is
+  wired `sufficient`, macOS simply continues to the normal password prompt.
+- Exit codes make the same contract scriptable: `0` match, `1` no match within
+  the attempt limit, `2` not enrolled, `3` camera error, `4` model missing.
 
 ## Honest limitations & security model
 

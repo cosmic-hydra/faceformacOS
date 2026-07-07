@@ -387,4 +387,11 @@ import Testing
         let paths = FaceUnlockConfig.modelSearchPaths(override: "/tmp/model.mlmodelc")
         #expect(paths.first?.path == "/tmp/model.mlmodelc")
     }
+
+    @Test func attemptLimitDefaults() {
+        // The advertised contract: 2 face attempts, then password fallback.
+        #expect(FaceUnlockConfig.defaultMaxAttempts == 2)
+        #expect(FaceUnlockConfig.maxAttemptsCeiling >= FaceUnlockConfig.defaultMaxAttempts)
+        #expect(FaceUnlockConfig.maxAttemptsCeiling <= 5)
+    }
 }

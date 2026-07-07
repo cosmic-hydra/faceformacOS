@@ -91,6 +91,29 @@ clean:
 	@rm -rf ~/Library/Developer/Xcode/DerivedData/$(APP_NAME)-*
 	@echo "✓ Clean complete"
 
+# ── faceformacOS headless face-unlock stack ──────────────────────────────
+.PHONY: faceunlock pam-module test-core install-faceunlock uninstall-faceunlock
+
+# Build the FaceUnlockCore library and the three CLIs (release)
+faceunlock:
+	swift build -c release
+
+# Build the pam_faceunlock PAM module
+pam-module:
+	$(MAKE) -C pam
+
+# Run the FaceUnlockCore unit tests
+test-core:
+	swift test
+
+# Build + install everything and wire /etc/pam.d (with backups)
+install-faceunlock:
+	sudo ./scripts/install.sh
+
+# Remove PAM wiring and installed faceunlock files
+uninstall-faceunlock:
+	sudo ./scripts/install.sh --uninstall
+
 # Print help
 help:
 	@echo "FaceGate-Mac Build System"
@@ -101,3 +124,10 @@ help:
 	@echo "  make dmg        — Create DMG installer"
 	@echo "  make install    — Build and install to /Applications"
 	@echo "  make clean      — Remove all build artifacts"
+	@echo ""
+	@echo "faceformacOS face-unlock stack:"
+	@echo "  make faceunlock           — Build FaceUnlockCore + CLIs (release)"
+	@echo "  make pam-module           — Build the pam_faceunlock PAM module"
+	@echo "  make test-core            — Run FaceUnlockCore unit tests"
+	@echo "  make install-faceunlock   — Build, install, and wire /etc/pam.d"
+	@echo "  make uninstall-faceunlock — Remove wiring and installed files"
