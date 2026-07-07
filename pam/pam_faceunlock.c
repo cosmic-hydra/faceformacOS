@@ -98,16 +98,17 @@ static void fu_log(int priority, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 /* Never openlog() here — that would hijack the host app's syslog identity.
- * Prefix the module name into the message instead. */
+ * Format the message first, then log it as data behind a fixed format string,
+ * so truncation can never bisect a conversion specifier. */
 static void fu_log(int priority, const char *fmt, ...)
 {
-    char prefixed[512];
+    char message[512];
     va_list ap;
 
-    snprintf(prefixed, sizeof(prefixed), "pam_faceunlock: %s", fmt);
     va_start(ap, fmt);
-    vsyslog(LOG_AUTHPRIV | priority, prefixed, ap);
+    vsnprintf(message, sizeof(message), fmt, ap);
     va_end(ap);
+    syslog(LOG_AUTHPRIV | priority, "pam_faceunlock: %s", message);
 }
 
 /* Parse a bounded positive integer; returns fallback on any parse error. */
@@ -321,12 +322,18 @@ static void fu_child_exec(const struct fu_options *opts, const struct passwd *pw
     _exit(FU_CHILD_EXEC_FAILED);
 }
 
-/* Wait for the child with a hard deadline; SIGKILL + reap on overrun. */
+/* Wait for the child with a hard deadline; SIGKILL + reap on overrun.
+ * The deadline is measured on the monotonic clock, not by counting poll
+ * iterations — EINTR-shortened sleeps and scheduling delays don't skew it. */
 static int fu_wait_child(pid_t child, long deadline_seconds, int *status)
 {
     struct timespec poll_interval = { 0, 100 * 1000 * 1000 }; /* 100 ms */
-    long waited_ms = 0;
-    long deadline_ms = deadline_seconds * 1000;
+    struct timespec now;
+    time_t deadline;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return -1;
+    deadline = now.tv_sec + deadline_seconds;
 
     for (;;) {
         pid_t reaped = waitpid(child, status, WNOHANG);
@@ -335,14 +342,13 @@ static int fu_wait_child(pid_t child, long deadline_seconds, int *status)
             return 0;
         if (reaped < 0 && errno != EINTR)
             return -1;
-        if (waited_ms >= deadline_ms) {
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec >= deadline) {
             kill(child, SIGKILL);
             while (waitpid(child, status, 0) < 0 && errno == EINTR)
                 ;
             return 1;
         }
         nanosleep(&poll_interval, NULL);
-        waited_ms += 100;
     }
 }
 
