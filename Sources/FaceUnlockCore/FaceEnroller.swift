@@ -19,7 +19,8 @@ public final class FaceEnroller {
                     cameraID: String? = nil,
                     dataDir: URL = FaceUnlockConfig.dataDirectory(),
                     timeout: TimeInterval = 120) {
-            self.samplesPerPose = samplesPerPose
+            // Guard the pose-index division in enroll() against a zero/negative count.
+            self.samplesPerPose = max(1, samplesPerPose)
             self.faceName = faceName
             self.modelPath = modelPath
             self.cameraID = cameraID

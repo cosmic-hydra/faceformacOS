@@ -40,7 +40,13 @@ public enum AutoType {
         let utf16 = Array(text.utf16)
         var index = 0
         while index < utf16.count {
-            let chunk = Array(utf16[index..<min(index + 20, utf16.count)])
+            var end = min(index + 20, utf16.count)
+            // Never split a surrogate pair across events — the receiving app
+            // inserts each event independently, and lone surrogates render as U+FFFD.
+            if end < utf16.count, (0xD800...0xDBFF).contains(utf16[end - 1]) {
+                end -= 1
+            }
+            let chunk = Array(utf16[index..<end])
 
             if let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
                 keyDown.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)

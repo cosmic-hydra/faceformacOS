@@ -30,8 +30,16 @@ public enum FaceUnlockConfig {
     /// Eye-aspect-ratio above which the eye is considered open.
     public static let blinkOpenEAR: Float = 0.24
 
-    /// Default verification timeout in seconds.
+    /// Default verification timeout in seconds (per attempt).
     public static let defaultVerifyTimeout: TimeInterval = 10
+
+    /// Maximum face-verification attempts per authentication before giving up
+    /// and falling back to password auth. Each attempt is one full camera
+    /// window of `defaultVerifyTimeout` seconds with a fresh liveness challenge.
+    public static let defaultMaxAttempts = 2
+
+    /// Hard ceiling on `--attempts` / the PAM `attempts=` option.
+    public static let maxAttemptsCeiling = 5
 
     /// Number of enrollment samples per pose (straight, left, right).
     public static let enrollmentSamplesPerPose = 3

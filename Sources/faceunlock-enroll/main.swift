@@ -14,7 +14,7 @@ options:
   --name <label>         label for this face (default "Face 1")
   --add                  add another face to an existing enrollment
   --force                replace any existing enrollment without asking
-  --samples <n>          samples per pose (default 3, total = 3 poses × n)
+  --samples <n>          samples per pose, 1..20 (default 3, total = 3 poses × n)
   --data-dir <path>      data directory (default ~/Library/Application Support/faceunlock)
   --model <path>         path to FaceEmbedding.mlmodelc
   --camera <unique-id>   use a specific camera
@@ -78,8 +78,18 @@ if store.hasEnrollment && !appending && !args.flag("force") {
     exit(FaceUnlockExitCode.usageError.rawValue)
 }
 
+if let raw = args.string("samples"), args.int("samples") == nil {
+    printErr("error: invalid --samples '\(raw)' (expected an integer)")
+    exit(FaceUnlockExitCode.usageError.rawValue)
+}
+let samplesPerPose = args.int("samples") ?? FaceUnlockConfig.enrollmentSamplesPerPose
+guard (1...20).contains(samplesPerPose) else {
+    printErr("error: --samples must be 1..20")
+    exit(FaceUnlockExitCode.usageError.rawValue)
+}
+
 let options = FaceEnroller.Options(
-    samplesPerPose: args.int("samples") ?? FaceUnlockConfig.enrollmentSamplesPerPose,
+    samplesPerPose: samplesPerPose,
     faceName: args.string("name") ?? "Face 1",
     modelPath: args.string("model"),
     cameraID: args.string("camera"),
